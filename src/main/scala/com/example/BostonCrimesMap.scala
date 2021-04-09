@@ -1,97 +1,145 @@
 package com.example
 
+import org.apache.spark.sql.expressions.UserDefinedFunction
 import org.apache.spark.broadcast.Broadcast
-import org.apache.spark.sql._
 import org.apache.spark.sql.functions._
 import org.apache.spark.sql.expressions._
-import org.apache.spark.sql.functions.{callUDF, lit}
+import org.apache.spark.sql.{DataFrame, SparkSession}
+import scala.collection.mutable
 
-object BostonCrimesMap extends App {
-  // Check number of arguments
-  if (args.length != 3) {
-    println("Error: Incorrect numbers arguments")
-    println("Usage: /path/to/jar {path/to/crime.csv} {path/to/offense_codes.csv} {path/to/output_folder}")
-    sys.exit(-1)
+object Boston {
+  // Median function
+  def median(inList: List[Long]): Long = {
+    val sortList = inList.sorted
+    val cnt: Int = inList.size
+    // for even values, take the average of the two central elements
+    if (cnt % 2 == 0) {
+      val first: Int = cnt/2 - 1
+      val second: Int = first + 1
+      (sortList(first) + sortList(second))/2
+    } else sortList(cnt/2)
   }
+  // UDF
+  def medianUDF: UserDefinedFunction = udf((x: mutable.WrappedArray[Long]) => median(x.toList))
 
-  // parse arguments
-  val crimeFile: String = args(0)
-  val offenseCodesFile: String = args(1)
-  val outFolder: String = args(2)
+  case class FreqCrimeTypes(DISTRICT: String, crime_type: String, crimes: Long)
 
-  // Create Spark Session
-  val spark = SparkSession.builder()
-    //.master("local")
-    .getOrCreate()
+  def main(args: Array[String]): Unit = {
+    if (args.length != 3) {
+      println("Usage Boston-crimea: {path/to/crime.csv} {path/to/offense_codes.csv} {path/to/output_folder} ")
+      sys.exit(-1)
+    }
+    val crimeFilename: String = args(0)
+    val offenseCodesFilename: String = args(1)
+    val resultFolder: String = args(2)
 
-  import spark.implicits._
+    val appName: String = "Boston-crimea"
+    val spark: SparkSession = SparkSession.builder()
+      .appName(appName)
+      .config("spark.driver.memory", "5g")
+      .master("local[2]")
+      .getOrCreate()
+    spark.sparkContext.setLogLevel("WARN")
 
-  // Read crime dataset (DISTRICT is null ignored)
-  val crimeDF: DataFrame = spark
-    .read
-    .options(Map("header" -> "true", "inferSchema" -> "true"))
-    .csv(crimeFile)
-    .filter($"DISTRICT".isNotNull)
+    import spark.sqlContext.implicits._
 
-  // Read offense_codes dataset
-  val offenseDF: DataFrame = spark
-    .read
-    .options(Map("header" -> "true", "inferSchema" -> "true"))
-    .csv(offenseCodesFile)
-    .withColumn("CRIME_TYPE", trim(split($"NAME", "-")(0)))
+    val dfOffenceCodes = spark.read
+      .option("header", "true")
+      .option("inferSchema", "true")
+      .csv(offenseCodesFilename)
+      .withColumn("crime_type", rtrim(split($"NAME", "-")(0)))
 
-  // broadcast offense_codes
-  val offenseBC: Broadcast[DataFrame] = spark.sparkContext.broadcast(offenseDF)
+    val dfOffenceCodesBr: Broadcast[DataFrame]  = spark.sparkContext.broadcast(dfOffenceCodes)
 
-  // Join datafame crime with offense_codes
-  val crimeOffence: DataFrame = crimeDF
-    .join(offenseBC.value, crimeDF("OFFENSE_CODE") === offenseBC.value("CODE"))
-    // import only uses columns
-    .select("INCIDENT_NUMBER", "DISTRICT", "YEAR", "MONTH", "Lat", "Long", "CRIME_TYPE")
-    // fill 0 for Lat and Long is null
-    .na.fill(0.0)
-    .cache
+    val dfCrime = spark.read
+      .option("header", "true")
+      .option("inferSchema", "true")
+      .csv(crimeFilename)
 
-  // Calculate crimes_total
-  val crimes_total = crimeOffence
-    .groupBy($"DISTRICT")
-    .agg(count($"INCIDENT_NUMBER").alias("crimes_total"))
+    val dfCrimeBoston = dfCrime
+      .join(dfOffenceCodesBr.value, ltrim(dfCrime("OFFENSE_CODE"),"0") === dfOffenceCodesBr.value("CODE"), "inner")
+      .select("INCIDENT_NUMBER", "DISTRICT", "MONTH", "Lat", "Long", "crime_type")
+      .na.fill(0.0) // replace Null with 0 for Lat and Long
+      .cache
 
-  // Calculate median crimes_monthly
-  val crimes_monthly = crimeOffence
-    .groupBy($"DISTRICT", $"YEAR", $"MONTH")
-    .agg(count($"INCIDENT_NUMBER").alias("group_cnt"))
-    .groupBy($"DISTRICT")
-    .agg(callUDF("percentile_approx", $"group_cnt", lit(0.5)).as("crimes_monthly"))
+    /* общее количество преступлений в этом районе*/
+    val dfCrimesTotal = dfCrimeBoston.groupBy( $"DISTRICT")
+      .agg(count($"INCIDENT_NUMBER").alias("crimes_total"))
+    dfCrimesTotal.show()
 
-  // Calculate frequent_crime_types
-  val frequent_crime_types = crimeOffence
-    .groupBy($"DISTRICT", $"CRIME_TYPE")
-    .agg(count($"INCIDENT_NUMBER").alias("group_cnt"))
-    .withColumn("numb", row_number().over(Window.partitionBy($"DISTRICT").orderBy($"group_cnt".desc)))
-    .filter($"numb" < 4)
-    .drop($"numb")
-    .groupBy($"DISTRICT")
-    .agg(collect_list($"CRIME_TYPE").alias("crime_list"))
-    .withColumn("frequent_crime_types", concat_ws(", ", $"crime_list"))
-    .drop($"crime_list")
+    /* медиана числа преступлений в месяц в этом районе с использованием функции percentile_approx()
+     (не точная - для четных значений берется первый элемент из середины отсортированного списка) */
+    val dfGroupByDistrictMonth = dfCrimeBoston.groupBy($"DISTRICT", $"MONTH")
+      .agg(count($"INCIDENT_NUMBER").alias("crimes"))
+    val dfCrimesMonthly = dfGroupByDistrictMonth.groupBy($"DISTRICT")
+      .agg(percentile_approx($"crimes", lit(0.5), lit(100)).alias("crimes_monthly"))
+    println("с использованием percentile_approx()")
+    dfCrimesMonthly.show()
 
-  // Calculate average Lat and Long
-  val lat_long = crimeOffence
-    .groupBy($"DISTRICT")
-    .agg(mean($"Lat").alias("lat"), mean($"Long").alias("lng"))
+    /* медиана числа преступлений в месяц в этом районе с использованием UDF
+     (более точная - для четных значений берется среднее двух элементов из середины отсортированного списка) */
+    val dfGroupByDistrictMonthUDF = dfCrimeBoston
+      .groupBy($"DISTRICT", $"MONTH")
+      .agg(count($"INCIDENT_NUMBER").alias("crimes"))
+      // Group by district and calculate median
+      .groupBy($"DISTRICT")
+      .agg(collect_list($"crimes").alias("month_list"))
+      .withColumn("crimes_monthly", medianUDF($"month_list"))
+      .drop($"month_list")
+    println("более точная с использованием UDF")
+    dfGroupByDistrictMonthUDF.show()
 
-  // all together
-  val result: DataFrame = crimes_total
-    .join(crimes_monthly, Seq("DISTRICT"))
-    .join(frequent_crime_types, Seq("DISTRICT"))
-    .join(lat_long, Seq("DISTRICT"))
+    /* три самых частых crime_type за всю историю наблюдений в этом районе, объединенных через запятую
+    с одним пробелом “, ” , расположенных в порядке убывания частоты
+    (версия c groupByKey) */
+    val dfFreqCrimeTypes = dfCrimeBoston.groupBy($"DISTRICT", $"crime_type")
+      .agg(count($"INCIDENT_NUMBER").alias("crimes"))
+      .as[FreqCrimeTypes]
+      .groupByKey(x => x.DISTRICT)
+      .flatMapGroups{
+        case(districtKey, elements) => elements.toList.sortBy(x => - x.crimes).take(3)
+      }
+      .groupBy($"DISTRICT")
+      .agg(collect_list($"crime_type").alias("crime_type_list"))
+      .withColumn("frequent_crime_types", concat_ws(", ",col("crime_type_list")))
+      .drop("crime_type_list")
+    dfFreqCrimeTypes.show(false)
 
-  result.repartition(1)
-    .write
-    .mode("OVERWRITE")
-    .parquet(outFolder)
+    /* три самых частых crime_type за всю историю наблюдений в этом районе, объединенных через запятую
+    с одним пробелом “, ” , расположенных в порядке убывания частоты
+    (версия c оконной функцией) */
+    val window: WindowSpec = Window.partitionBy($"DISTRICT").orderBy($"crimes".desc)
+    val dfFreqCrimeTypesWindow = dfCrimeBoston
+      .groupBy($"DISTRICT", $"crime_type")
+      .agg(count($"INCIDENT_NUMBER").alias("crimes"))
+      .withColumn("rn", row_number().over(window))
+      .filter($"rn" < 4)
+      .drop($"rn")
+      .groupBy($"DISTRICT")
+      .agg(collect_list($"crime_type").alias("crime_type_list"))
+      .withColumn("frequent_crime_types", concat_ws(", ",col("crime_type_list")))
+      .drop($"crime_type_list")
+    println("с использованием оконной функции:")
+    dfFreqCrimeTypesWindow.show(false)
 
-  spark.stop()
+    /* широта координаты района, рассчитанная как среднее по всем широтам инцидентов,
+       долгота координаты района, рассчитанная как среднее по всем долготам инцидентов */
+    val dfLatLong = dfCrimeBoston.groupBy( $"DISTRICT")
+      .agg(mean($"Lat").alias("lat"),
+        mean($"Long").alias("long"))
+    dfLatLong.show()
 
+    val result: DataFrame = dfCrimesTotal.na.fill(" ")
+      .join(dfCrimesMonthly.na.fill(" "), Seq("DISTRICT"))
+      .join(dfFreqCrimeTypes.na.fill(" "), Seq("DISTRICT"))
+      .join(dfLatLong.na.fill(" "), Seq("DISTRICT"))
+    result.show(false)
+
+    result.repartition(1)
+      .write
+      .mode("OVERWRITE")
+      .parquet(resultFolder)
+
+    spark.stop()
+    }
 }
