@@ -1,12 +1,13 @@
-name := "BostonCrimesMap"
+name := "Boston"
 
-version := "0.1"
+version := "1.0"
 
-scalaVersion := "2.11.8"
+scalaVersion := "2.12.10"
+
+lazy val sparkVersion = "3.1.1"
+
 
 libraryDependencies ++= Seq(
-  "org.apache.spark"  %% "spark-core" % "2.3.2" % "provided",
-  "org.apache.spark"  %% "spark-sql" % "2.3.2" % "provided"
-
+  "org.apache.spark"  %% "spark-core" % sparkVersion % "provided",
+  "org.apache.spark"  %% "spark-sql" % sparkVersion % "provided"
 )
-
