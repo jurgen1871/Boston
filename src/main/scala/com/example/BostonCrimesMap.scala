@@ -22,6 +22,7 @@ object Boston {
   // UDF
   def medianUDF: UserDefinedFunction = udf((x: mutable.WrappedArray[Long]) => median(x.toList))
 
+
   case class FreqCrimeTypes(DISTRICT: String, crime_type: String, crimes: Long)
 
   def main(args: Array[String]): Unit = {
@@ -139,6 +140,9 @@ object Boston {
       .write
       .mode("OVERWRITE")
       .parquet(resultFolder)
+
+    // новое изменение
+    result.printSchema()
 
     spark.stop()
     }
